@@ -81,7 +81,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository }}:v1.1name: CI - Configure, Build, Test
+          tags: ghcr.io/${{ steps.reponame.outputs.lowercase }}:v1
 
 
 
