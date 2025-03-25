@@ -1,51 +1,127 @@
-# Stage 1: Build                                                 (1)
-FROM ubuntu:24.04 AS builder
+name: CI - Configure, Build, Test
 
-# Update package lists and install build dependencies           (2)
-RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends \
-       git cmake g++ ninja-build openmpi-bin libopenmpi-dev \
-       python3 python3-pip python3-dev \
-       libboost-test-dev libboost-serialization-dev \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
 
-# Copy the application source code into the builder stage         (3)
-COPY . /workspaces/mpihelloworld
+  workflow_dispatch:
 
-# Set the working directory for the build                           (4)
-WORKDIR /workspaces/mpihelloworld
+jobs:
+  build:
+    strategy:
+      matrix:
+        runs-on: [self-ubuntu-24.04, karolina]
+    if: "!contains(github.event.head_commit.message, 'skip build')"
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-# Set environment variables to allow MPI to run as root             (5)
-ENV OMPI_ALLOW_RUN_AS_ROOT=1
-ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      - name: Configure the Build System
+        run: |
+            if [ "${{ matrix.runs-on }}" == "karolina" ]; then
+                module load Boost/1.83.0-GCC-13.2.0 Ninja/1.12.1-GCCcore-13.3.0 OpenMPI/4.1.6-GCC-13.2.0
+            fi
+            cmake --preset default
+            tree
 
-# Configure, build, test, and install the application using CMake presets (6)
-RUN cmake --preset default      \
-    && cmake --build --preset default                  \
-    && ctest --preset default                          \
-    && cmake --build --preset default -t install        \
-    && rm -rf build
+      - name: Build the Project
+        run: |
+          if [ "${{ matrix.runs-on }}" == "karolina" ]; then
+               module load Boost/1.83.0-GCC-13.2.0 Ninja/1.12.1-GCCcore-13.3.0 OpenMPI/4.1.6-GCC-13.2.0
+          fi
+          cmake --build --preset default
+#          mpirun -np ${{ matrix.nps }} build/default/myapp/myapp
 
-# Stage 2: Runtime                                                 (7)
-FROM ubuntu:24.04 AS runtime
+      - name: Run Tests
+        run: |
+          if [ "${{ matrix.runs-on }}" == "karolina" ]; then
+               module load Boost/1.83.0-GCC-13.2.0 OpenMPI/4.1.6-GCC-13.2.0
+          fi
+          ctest --preset default
 
-# Install runtime dependencies (only what is needed to run the application) (8)
-RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get -y install --no-install-recommends           \
-       openmpi-bin libopenmpi3t64                           \
-       libboost-test1.83.0 libboost-serialization1.83.0     \
-       python3 python3-pip python3-dev                      \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+      - name: Package the Application
+        run: |
+          if [ "${{ matrix.runs-on }}" == "karolina" ]; then
+               module load Boost/1.83.0-GCC-13.2.0 OpenMPI/4.1.6-GCC-13.2.0
+          fi
+          cmake --build --preset default -t package
 
-# Copy the installed application from the builder stage             (9)
-COPY --from=builder /usr/local /usr/local
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.runs-on }}-np${{ matrix.nps }}
+          path: |
+            build/default/*.tar.gz
+            LICENSE
+            README.adoc
 
-# Optionally, copy additional runtime files if needed                 (10)
-# COPY --from=builder /workspaces/mpihelloworld/config /config
+  build-docker:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-# Set the working directory (if needed)                              (11)
-WORKDIR /workspaces/mpihelloworld
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-# Set the runtime environment variables for MPI                       (12)
-ENV OMPI_ALLOW_RUN_AS_ROOT=1
-ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+      -
+        name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  build-apptainer:
+    runs-on: self-apptainer
+#    needs: build-docker
+    env:
+      apptainer: /opt/apptainer/v1.4.0/apptainer/bin/apptainer
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      -
+        name: Login to GitHub Container Registry
+        run: |
+          ${{ env.apptainer }} remote login  -u ${{ github.repository_owner }} -p ${{ secrets.GHCR_PAT }} oras://ghcr.io
+
+      - name: Convert Docker Image to Apptainer SIF
+        run: |
+          # Pull the Docker image and convert it to a Singularity Image Format (SIF) file.
+          sif=$( basename ${{ github.repository }}.sif )
+          ${{ env.apptainer }} pull -F $sif docker://ghcr.io/${{ github.repository }}:2.0
+          ${{ env.apptainer }} inspect $sif
+
+      - name: Upload Apptainer SIF to GitHub Container Registry
+        run: |
+          # Push the SIF file to the GitHub Container Registry.
+          sif=$( basename ${{ github.repository }}.sif )
+          ${{ env.apptainer }} push $sif oras://ghcr.io/${{ github.repository }}:2.0-sif
